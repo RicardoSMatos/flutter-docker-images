@@ -1,0 +1,189 @@
+name: build
+
+# Builds and publishes the Flutter images to GHCR.
+#
+# Each (version, variant, platform) is built on a native runner and pushed by
+# digest; a final job stitches the digests into one multi-arch manifest per tag.
+# arm64 uses GitHub's native ARM runners (free on public repos), so nothing is
+# emulated under QEMU.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - versions.json
+      - .github/workflows/build.yml
+  workflow_dispatch:
+    inputs:
+      flutter_version:
+        description: 'Build a single Flutter version (e.g. 3.44.8). Empty = everything in versions.json.'
+        required: false
+        type: string
+      variant:
+        description: 'Which variant to build'
+        required: false
+        default: all
+        type: choice
+        options: [all, base, android]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: flutter
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Expand versions.json (or the dispatch input) into build/merge matrices
+  # ---------------------------------------------------------------------------
+  matrix:
+    runs-on: ubuntu-24.04
+    outputs:
+      builds: ${{ steps.gen.outputs.builds }}
+      images: ${{ steps.gen.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: gen
+        env:
+          INPUT_VERSION: ${{ inputs.flutter_version }}
+          INPUT_VARIANT: ${{ inputs.variant || 'all' }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_VERSION}" ]; then
+            # Ad-hoc build: only the exact version tag, never the aliases.
+            src=$(jq -n --arg v "${INPUT_VERSION}" '{versions:[{version:$v,aliases:[]}]}')
+          else
+            src=$(cat versions.json)
+          fi
+
+          images=$(echo "$src" | jq -c --arg vf "${INPUT_VARIANT}" '
+            [ .versions[] as $e
+              | ["base","android"][]
+              | select($vf == "all" or . == $vf)
+              | {version: $e.version, aliases: ($e.aliases // []), variant: .}
+            ]')
+
+          # base → amd64 + arm64; android → amd64 only (the Android SDK has no
+          # linux-arm64 platform-tools).
+          builds=$(echo "$images" | jq -c '
+            [ .[] as $i
+              | ( if $i.variant == "android"
+                  then [{platform:"linux/amd64", runner:"ubuntu-24.04"}]
+                  else [{platform:"linux/amd64", runner:"ubuntu-24.04"},
+                        {platform:"linux/arm64", runner:"ubuntu-24.04-arm"}]
+                  end )[]
+              | $i + .
+            ]')
+
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "builds=$builds" >> "$GITHUB_OUTPUT"
+          echo "$builds" | jq .
+
+  # ---------------------------------------------------------------------------
+  # One native build per architecture, pushed by digest
+  # ---------------------------------------------------------------------------
+  build:
+    needs: matrix
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.builds) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare
+        id: prep
+        run: |
+          echo "arch=${{ matrix.platform }}" | tr '/' '-' >> "$GITHUB_OUTPUT"
+          echo "repo_owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.variant }}
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            FLUTTER_VERSION=${{ matrix.version }}
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.version }}-${{ matrix.variant }}-${{ steps.prep.outputs.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.version }}-${{ matrix.variant }}-${{ steps.prep.outputs.arch }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ steps.prep.outputs.repo_owner }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.version }}-${{ matrix.variant }}-${{ steps.prep.outputs.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Stitch per-arch digests into the published multi-arch tags
+  # ---------------------------------------------------------------------------
+  merge:
+    needs: [matrix, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.images) }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.version }}-${{ matrix.variant }}-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        env:
+          VERSION: ${{ matrix.version }}
+          VARIANT: ${{ matrix.variant }}
+          ALIASES: ${{ toJSON(matrix.aliases) }}
+        run: |
+          set -euo pipefail
+          owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          image="${REGISTRY}/${owner}/${IMAGE_NAME}"
+
+          # base → "3.44.8", "stable"…  android → "3.44.8-android", "stable-android"…
+          suffix=""
+          [ "$VARIANT" = "android" ] && suffix="-android"
+
+          tags=()
+          for t in "$VERSION" $(echo "$ALIASES" | jq -r '.[]'); do
+            tags+=(-t "${image}:${t}${suffix}")
+          done
+
+          docker buildx imagetools create "${tags[@]}" \
+            $(printf "${image}@%s " $(ls /tmp/digests))
+
+          docker buildx imagetools inspect "${image}:${VERSION}${suffix}"

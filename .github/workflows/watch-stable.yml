@@ -1,0 +1,72 @@
+name: watch-stable
+
+# Weekly check for a new Flutter stable release. When one shows up, opens a PR
+# adding it to versions.json and moving the `stable`/`latest` aliases onto it —
+# merging that PR is what triggers the image build.
+#
+# Requires "Allow GitHub Actions to create and approve pull requests"
+# (Settings → Actions → General → Workflow permissions).
+
+on:
+  schedule:
+    - cron: '17 6 * * 1' # Mondays, 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: latest
+        name: Resolve latest stable
+        run: |
+          set -euo pipefail
+          releases=$(curl -fsSL https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json)
+          version=$(echo "$releases" | jq -r '
+            .current_release.stable as $h
+            | .releases[] | select(.hash == $h and .channel == "stable") | .version' | head -n1)
+          [ -n "$version" ] || { echo "could not resolve stable version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "minor=$(echo "$version" | cut -d. -f1,2)" >> "$GITHUB_OUTPUT"
+          echo "Latest stable: $version"
+
+      - id: update
+        name: Update versions.json
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+          MINOR: ${{ steps.latest.outputs.minor }}
+        run: |
+          set -euo pipefail
+          if jq -e --arg v "$VERSION" '.versions[] | select(.version == $v)' versions.json > /dev/null; then
+            echo "$VERSION already tracked — nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          jq --arg v "$VERSION" --arg m "$MINOR" '
+            .versions |= map(.aliases |= (. - ["stable", "latest", $m]))
+            | .versions |= ([{version: $v, aliases: [$m, "stable", "latest"]}] + .)
+          ' versions.json > versions.json.new
+          mv versions.json.new versions.json
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          cat versions.json
+
+      - name: Open PR
+        if: steps.update.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: flutter-${{ steps.latest.outputs.version }}
+          title: 'feat: Flutter ${{ steps.latest.outputs.version }}'
+          commit-message: 'feat: Flutter ${{ steps.latest.outputs.version }}'
+          body: |
+            New Flutter stable detected: **${{ steps.latest.outputs.version }}**.
+
+            Merging this builds and publishes:
+            - `flutter:${{ steps.latest.outputs.version }}`, `:${{ steps.latest.outputs.minor }}`, `:stable`, `:latest`
+            - the matching `-android` tags

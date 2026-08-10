@@ -1,0 +1,9 @@
+{
+  "$comment": "Flutter versions to build. `aliases` are extra tags pointing at that version; keep `stable`/`latest` on exactly one entry.",
+  "versions": [
+    {
+      "version": "3.44.8",
+      "aliases": ["3.44", "stable", "latest"]
+    }
+  ]
+}
