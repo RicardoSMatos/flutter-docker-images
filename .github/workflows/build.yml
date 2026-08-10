@@ -6,6 +6,13 @@ name: build
 # digest; a final job stitches the digests into one multi-arch manifest per tag.
 # arm64 uses GitHub's native ARM runners (free on public repos), so nothing is
 # emulated under QEMU.
+#
+# Versions already published are not rebuilt: a published tag is meant to be
+# immutable, so rebuilding it would hand a new digest to whoever pinned it.
+# The registry is probed first and each image lands in one of three buckets —
+# build (missing), retag (present, but its aliases point elsewhere), or skip.
+# A change to the Dockerfile forces a rebuild of everything, since that is the
+# one case where an existing tag's content really is out of date.
 
 on:
   push:
@@ -26,6 +33,11 @@ on:
         default: all
         type: choice
         options: [all, base, android]
+      force:
+        description: 'Rebuild even if the tag is already published (replaces its digest)'
+        required: false
+        default: false
+        type: boolean
 
 env:
   REGISTRY: ghcr.io
@@ -33,20 +45,26 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Expand versions.json (or the dispatch input) into build/merge matrices
+  # Expand versions.json (or the dispatch input) into build/merge matrices,
+  # dropping whatever the registry already has
   # ---------------------------------------------------------------------------
   matrix:
     runs-on: ubuntu-24.04
     outputs:
       builds: ${{ steps.gen.outputs.builds }}
       images: ${{ steps.gen.outputs.images }}
+      retags: ${{ steps.gen.outputs.retags }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need history to diff the push against its parent
 
       - id: gen
         env:
           INPUT_VERSION: ${{ inputs.flutter_version }}
           INPUT_VARIANT: ${{ inputs.variant || 'all' }}
+          INPUT_FORCE: ${{ inputs.force }}
+          BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
 
@@ -57,16 +75,76 @@ jobs:
             src=$(cat versions.json)
           fi
 
-          images=$(echo "$src" | jq -c --arg vf "${INPUT_VARIANT}" '
+          wanted=$(echo "$src" | jq -c --arg vf "${INPUT_VARIANT}" '
             [ .versions[] as $e
               | ["base","android"][]
               | select($vf == "all" or . == $vf)
               | {version: $e.version, aliases: ($e.aliases // []), variant: .}
             ]')
 
+          # The Dockerfile changing is the one case where an already-published
+          # tag is genuinely stale. If the diff can't be computed (first push on
+          # a branch, forced push), assume it changed rather than silently
+          # publishing nothing.
+          force="${INPUT_FORCE:-false}"
+          if [ "$force" != "true" ] && [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            changed=$(git diff --name-only "$BEFORE" "$GITHUB_SHA" 2>/dev/null) || changed="Dockerfile"
+            case "$changed" in *Dockerfile*) force=true ;; esac
+          fi
+          echo "force rebuild: $force"
+
+          owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          repo="${owner}/${IMAGE_NAME}"
+          accept='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+          # Anonymous pull token — the package is public, so no credentials.
+          token=$(curl -fsSL "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull" | jq -r '.token')
+
+          # Digest a tag currently resolves to, or empty when it doesn't exist.
+          digest_of() {
+            curl -sSI \
+              -H "Authorization: Bearer ${token}" \
+              -H "Accept: ${accept}" \
+              "https://ghcr.io/v2/${repo}/manifests/$1" \
+              | tr -d '\r' \
+              | awk -F': ' 'tolower($1) == "docker-content-digest" { print $2 }'
+          }
+
+          to_build='[]'
+          to_retag='[]'
+
+          while read -r img; do
+            version=$(echo "$img" | jq -r '.version')
+            variant=$(echo "$img" | jq -r '.variant')
+            suffix=""
+            [ "$variant" = "android" ] && suffix="-android"
+
+            published=""
+            [ "$force" = "true" ] || published=$(digest_of "${version}${suffix}")
+
+            if [ -z "$published" ]; then
+              echo "build   ${version}${suffix}"
+              to_build=$(jq -c --argjson i "$img" '. + [$i]' <<< "$to_build")
+              continue
+            fi
+
+            # Present already: the only thing that can still be wrong is where
+            # its aliases point.
+            stale=false
+            for alias in $(echo "$img" | jq -r '.aliases[]'); do
+              [ "$(digest_of "${alias}${suffix}")" = "$published" ] || stale=true
+            done
+
+            if [ "$stale" = "true" ]; then
+              echo "retag   ${version}${suffix}"
+              to_retag=$(jq -c --argjson i "$img" '. + [$i]' <<< "$to_retag")
+            else
+              echo "skip    ${version}${suffix} (published, aliases current)"
+            fi
+          done < <(echo "$wanted" | jq -c '.[]')
+
           # base → amd64 + arm64; android → amd64 only (the Android SDK has no
           # linux-arm64 platform-tools).
-          builds=$(echo "$images" | jq -c '
+          builds=$(echo "$to_build" | jq -c '
             [ .[] as $i
               | ( if $i.variant == "android"
                   then [{platform:"linux/amd64", runner:"ubuntu-24.04"}]
@@ -76,7 +154,8 @@ jobs:
               | $i + .
             ]')
 
-          echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "images=$to_build" >> "$GITHUB_OUTPUT"
+          echo "retags=$to_retag" >> "$GITHUB_OUTPUT"
           echo "builds=$builds" >> "$GITHUB_OUTPUT"
           echo "$builds" | jq .
 
@@ -85,6 +164,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     needs: matrix
+    if: needs.matrix.outputs.builds != '[]'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -144,6 +224,7 @@ jobs:
   # ---------------------------------------------------------------------------
   merge:
     needs: [matrix, build]
+    if: needs.matrix.outputs.images != '[]'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -189,4 +270,50 @@ jobs:
           docker buildx imagetools create "${tags[@]}" \
             $(printf "${image}@sha256:%s " $(ls /tmp/digests))
 
+          docker buildx imagetools inspect "${image}:${VERSION}${suffix}"
+
+  # ---------------------------------------------------------------------------
+  # Already published, only the aliases moved — copy the existing manifest
+  # instead of rebuilding it
+  # ---------------------------------------------------------------------------
+  retag:
+    needs: matrix
+    if: needs.matrix.outputs.retags != '[]'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.retags) }}
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point aliases at the published manifest
+        env:
+          VERSION: ${{ matrix.version }}
+          VARIANT: ${{ matrix.variant }}
+          ALIASES: ${{ toJSON(matrix.aliases) }}
+        run: |
+          set -euo pipefail
+          owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          image="${REGISTRY}/${owner}/${IMAGE_NAME}"
+
+          suffix=""
+          [ "$VARIANT" = "android" ] && suffix="-android"
+
+          tags=()
+          for t in $(echo "$ALIASES" | jq -r '.[]'); do
+            tags+=(-t "${image}:${t}${suffix}")
+          done
+
+          # Source is the version tag itself, so the digest is preserved.
+          docker buildx imagetools create "${tags[@]}" "${image}:${VERSION}${suffix}"
           docker buildx imagetools inspect "${image}:${VERSION}${suffix}"

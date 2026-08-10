@@ -91,9 +91,21 @@ Move `stable`/`latest` off the previous entry — every alias must appear exactl
 once. The `watch-stable` workflow does this automatically once a week by
 opening a PR when a new Flutter stable is released.
 
+**Published version tags are immutable.** Before building, the workflow asks
+the registry what already exists and only builds what's missing, so leaving old
+entries in `versions.json` costs nothing and a version tag never changes digest
+under someone who pinned it. If an entry is already published but its aliases
+moved, the existing manifest is copied onto the new aliases instead of being
+rebuilt.
+
+The exception is a change to the `Dockerfile`: that rebuilds and republishes
+every version, because it's the one case where a published tag's contents are
+genuinely out of date.
+
 To build a one-off version without touching `versions.json`, run the `build`
 workflow manually with a `flutter_version` input; it publishes only that exact
-version tag.
+version tag. That run also skips the build if the tag exists — tick `force` to
+rebuild and replace it anyway.
 
 ## Building locally
 
