@@ -126,8 +126,11 @@ jobs:
 
       - name: Export digest
         run: |
+          # The `sha256:` prefix is stripped because upload-artifact@v4 rejects
+          # `:` in file names; the merge job puts it back.
+          digest='${{ steps.build.outputs.digest }}'
           mkdir -p /tmp/digests
-          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -184,6 +187,6 @@ jobs:
           done
 
           docker buildx imagetools create "${tags[@]}" \
-            $(printf "${image}@%s " $(ls /tmp/digests))
+            $(printf "${image}@sha256:%s " $(ls /tmp/digests))
 
           docker buildx imagetools inspect "${image}:${VERSION}${suffix}"
