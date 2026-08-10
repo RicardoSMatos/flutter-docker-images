@@ -1,0 +1,53 @@
+name: Request a Flutter version
+description: Ask for an image of a Flutter version that isn't published yet
+title: 'Request: Flutter <x.y.z>'
+labels: [version-request]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Images are published on demand. Check the
+        [published tags](https://github.com/RicardoSMatos/flutter-docker-images/pkgs/container/flutter)
+        first — the version may already be there.
+
+  - type: input
+    id: version
+    attributes:
+      label: Flutter version
+      description: Exact tag from the flutter/flutter repository, e.g. `3.41.3`.
+      placeholder: 3.41.3
+    validations:
+      required: true
+
+  - type: dropdown
+    id: variant
+    attributes:
+      label: Variant
+      options:
+        - base (Flutter + web)
+        - android (base + Android SDK)
+        - both
+      default: 0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platforms
+    attributes:
+      label: Platform
+      description: The `android` variant is `linux/amd64` only.
+      options:
+        - linux/amd64
+        - linux/arm64
+        - both
+      default: 0
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else?
+      description: e.g. a different Android API level, or how long you'll need the tag around.
+    validations:
+      required: false

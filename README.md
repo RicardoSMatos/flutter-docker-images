@@ -55,10 +55,29 @@ a different uid don't trip git's ownership check.
 
 ### Why not Alpine
 
-The Dart SDK distributed by Google is linked against glibc and there is no
-official musl build, so Flutter cannot run on Alpine without a glibc shim that
-fails in subtle ways. `debian:bookworm-slim` is the smallest base that stays on
-a supported path.
+Alpine would be the obvious way to shrink these images, but it doesn't work:
+the Dart SDK binaries Google ships for Linux are dynamically linked against
+**glibc**, and there is no official musl build. Running them on Alpine requires
+a shim (`gcompat`, or an unofficial glibc package), which is unsupported by the
+Flutter team and fails in ways that are hard to debug from a CI log.
+
+`debian:bookworm-slim` is the smallest base that stays on a supported path.
+The bulk of the image is the Dart SDK plus the precached web artifacts, which
+would be there on any base — the difference the base itself makes is small
+compared to what precaching costs, and precaching is the entire point.
+
+Runtime images are a different story: serve your built `build/web` from
+`nginx:alpine`. These images are build-time only.
+
+## Requesting a version
+
+Not every Flutter release is prebuilt — versions are published on demand to
+keep the registry tidy.
+
+If you need a tag that isn't listed, [open a version request][request] and it
+will be built. Please say which variant and platform you need.
+
+[request]: https://github.com/RicardoSMatos/flutter-docker-images/issues/new?template=version-request.yml
 
 ## Adding a version
 
@@ -85,5 +104,19 @@ docker run --rm flutter:local flutter --version
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Flutter, Dart and the Android SDK are distributed
-under their own licenses.
+The contents of this repository — the Dockerfile, the workflows, this README —
+are **MIT** licensed (see [LICENSE](LICENSE)), an OSI-approved permissive
+license: use, modify and redistribute freely, including commercially.
+
+The *images* also bundle third-party software that keeps its own terms:
+
+| Component | License |
+| --- | --- |
+| Flutter SDK / Dart SDK | [BSD 3-Clause](https://github.com/flutter/flutter/blob/master/LICENSE) |
+| Debian base packages | their respective licenses (mostly GPL/LGPL/MIT/BSD) |
+| OpenJDK 17 (`-android`) | GPLv2 with Classpath Exception |
+| Android SDK, build-tools, platform-tools (`-android`) | [Android SDK Terms and Conditions](https://developer.android.com/studio/terms) — **proprietary**, redistribution is restricted |
+
+Pulling an `-android` image means accepting the Android SDK terms; the image
+build accepts the SDK licenses non-interactively on your behalf, exactly as a
+local `flutter doctor --android-licenses` would.
