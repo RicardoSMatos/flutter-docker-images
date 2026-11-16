@@ -2,11 +2,17 @@
   "$comment": "Flutter versions to build. `aliases` are extra tags pointing at that version; keep `stable`/`latest` on exactly one entry.",
   "versions": [
     {
-      "version": "3.47.7",
+      "version": "3.50.0",
       "aliases": [
-        "3.47",
+        "3.50",
         "stable",
         "latest"
+      ]
+    },
+    {
+      "version": "3.47.7",
+      "aliases": [
+        "3.47"
       ]
     },
     {
